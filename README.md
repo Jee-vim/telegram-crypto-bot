@@ -1,4 +1,5 @@
 ## Run
+create a file called `config.py` then copy paste this code and put ur own
 ```
 BINANCE_API_KEY = 'your binance api key'
 BINANCE_API_SECRET = 'your binance api secret'
