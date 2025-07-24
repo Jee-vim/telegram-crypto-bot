@@ -1,5 +1,8 @@
+import websockets
+import json
 import datetime
 import httpx
+import asyncio
 import logging
 import pandas as pd
 from telegram import Update, BotCommand
@@ -11,9 +14,8 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands
 from config import TELEGRAM_BOT_TOKEN, BINANCE_API_KEY, BINANCE_API_SECRET, CHAT_ID, NEWS_API_KEY
-from ta.volatility import BollingerBands
 from strategy import bollinger_strategy, ema_strategy, rsi_strategy, macd_strategy, stochastic_strategy, format_price
-
+import collections
 
 client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
 
@@ -23,6 +25,51 @@ logger = logging.getLogger(__name__)
 def escape_markdown_v2(text):
     escape_chars = '_*[]()~`>#+-=|{}.!'
     return ''.join('\\' + char if char in escape_chars else char for char in text)
+
+async def monitor_multiple_volume_ws(app, symbols, interval="1m"):
+    streams = [f"{s.lower()}@kline_{interval}" for s in symbols]
+    uri = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+
+    # Use a rolling deque per symbol
+    volume_history = {s: collections.deque(maxlen=30) for s in symbols}
+
+    async with websockets.connect(uri) as ws:
+        await app.bot.send_message(CHAT_ID, f"📡 Monitoring: {', '.join(symbols)}")
+
+        async for message in ws:
+            try:
+                msg = json.loads(message)
+                stream = msg["stream"]
+                data = msg["data"]
+                kline = data["k"]
+                symbol = kline["s"]  # This is uppercased already
+                is_closed = kline["x"]
+
+                if not is_closed:
+                    continue
+
+                vol = float(kline["v"])
+                history = volume_history[symbol]
+                history.append(vol)
+
+                if len(history) < 30:
+                    continue
+
+                avg_vol = sum(history) / len(history)
+                vol_ratio = vol / avg_vol
+
+                if vol_ratio > 2.5:
+                    alert = (
+                        f"*⚠️ Volume Spike Detected*\n"
+                        f"{escape_markdown(symbol, 2)}\n"
+                        f"Last Vol: {vol:,.2f}\n"
+                        f"Avg Vol (30m): {avg_vol:,.2f}\n"
+                        f"Ratio: {vol_ratio:.2f}"
+                    )
+                    await app.bot.send_message(CHAT_ID, alert, parse_mode="MarkdownV2")
+
+            except Exception as e:
+                logger.warning(f"WebSocket error: {e}")
 
 def get_top_symbols(base_asset='USDT', top_n=10):
     info = client.get_exchange_info()
@@ -131,44 +178,6 @@ def combine_signals(daily, four_hour):
 
     return signal, reasons, price
 
-async def advise(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != CHAT_ID:
-        await update.message.reply_text("🚫 You are not authorized to use this bot.")
-        return
-
-    await update.message.chat.send_action(action=ChatAction.TYPING)
-    try:
-        symbol = context.args[0].upper() + "USDT"
-    except IndexError:
-        await update.message.reply_text("❌ Usage: /advise BTC")
-        return
-
-    try:
-        df_daily = fetch_data(symbol, '1d')
-        df_4h = fetch_data(symbol, '4h', limit=60)  # 4h timeframe, 60 candles ~10 days
-
-        daily_analysis = analyze_single_timeframe(df_daily)
-        four_hour_analysis = analyze_single_timeframe(df_4h)
-
-        signal, reasons, price = combine_signals(daily_analysis, four_hour_analysis)
-
-        symbol_md = escape_markdown(symbol, version=2)
-        signal_md = escape_markdown(signal, version=2)
-        reasons_md = [escape_markdown(r, version=2) for r in reasons]
-        price_str = escape_markdown(f"${price:,.2f}", version=2)
-
-        msg = f"*📊 {symbol_md}*\n"
-        msg += f"💰 {price_str}\n"
-        msg += f"📈 {signal_md}\n\n"
-        msg += "*Reasons:*\n" + "\n".join([f"\\- {r}" for r in reasons_md])
-        msg += "\n\n_DYOR\\._"
-
-        await update.message.reply_text(msg, parse_mode="MarkdownV2")
-
-    except Exception as e:
-        logger.error(f"Error analyzing {symbol}: {e}")
-        await update.message.reply_text(f"❌ Failed to analyze {symbol}\n{str(e)}")
-
 async def suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != CHAT_ID:
         await update.message.reply_text("🚫 You are not authorized to use this bot.")
@@ -206,65 +215,6 @@ async def suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in suggest command: {e}")
         await update.message.reply_text("❌ Failed to generate suggestions.")
-
-async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != CHAT_ID:
-        await update.message.reply_text("🚫 Unauthorized.")
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /compare BTC ETH ADA")
-        return
-
-    results = []
-    for sym in context.args:
-        symbol = sym.upper() + "USDT"
-        try:
-            df_daily = fetch_data(symbol, '1d')
-            df_4h = fetch_data(symbol, '4h', limit=60)
-            daily_analysis = analyze_single_timeframe(df_daily)
-            four_hour_analysis = analyze_single_timeframe(df_4h)
-            signal, _, price = combine_signals(daily_analysis, four_hour_analysis)
-            results.append((symbol, signal, price))
-        except Exception as e:
-            results.append((symbol, "Error", 0))
-
-    # Format output as a neat table
-    lines = ["Symbol       | Price     | Signal",
-             "------------ | --------- | -------------"]
-    for sym, sig, price in results:
-        lines.append(f"{sym.ljust(12)} | ${price:9.2f} | {sig}")
-
-    message = "*📊 Comparison:*\n```\n" + "\n".join(lines) + "\n```"
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-async def volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != CHAT_ID:
-        await update.message.reply_text("🚫 Unauthorized.")
-        return
-    try:
-        symbol = context.args[0].upper() + "USDT"
-    except IndexError:
-        await update.message.reply_text("❌ Usage: /volume BTC")
-        return
-
-    df = fetch_data(symbol, interval='1d', limit=30)
-    avg_vol = df['volume'].mean()
-    last_vol = df.iloc[-1]['volume']
-    vol_ratio = last_vol / avg_vol
-
-    msg = f"*📊 Volume info for {symbol}:*\n"
-    msg += f"Average Volume (30d): {avg_vol:,.2f}\n"
-    msg += f"Last Volume (1d): {last_vol:,.2f}\n"
-    msg += f"Volume Ratio (Last/Avg): {vol_ratio:.2f}\n"
-
-    if vol_ratio > 2:
-        msg += "⚠️ Volume spike detected!\n"
-    elif vol_ratio < 0.5:
-        msg += "⚠️ Volume drop detected!\n"
-    else:
-        msg += "Volume is normal.\n"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != CHAT_ID:
@@ -540,122 +490,29 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in trade command: {e}")
         error_msg = escape_markdown(f"❌ Error generating trade: {str(e)}", version=2)
         await update.message.reply_text(error_msg, parse_mode="MarkdownV2")
-async def scalping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != CHAT_ID:
-        await update.message.reply_text("🚫 Unauthorized.")
-        return
-        
-    await update.message.chat.send_action(action=ChatAction.TYPING)
-    
-    try:
-        # Get top 20 symbols by 24h volume
-        top_symbols = get_top_symbols(top_n=20)
-        
-        # Fetch current volume data
-        tickers = client.get_ticker()
-        volume_data = []
-        
-        for t in tickers:
-            symbol = t['symbol']
-            if symbol in top_symbols:
-                # Calculate volume change percentage
-                current_vol = float(t['quoteVolume'])
-                open_price = float(t['openPrice'])
-                last_price = float(t['lastPrice'])
-                
-                # Calculate price change percentage
-                price_change = ((last_price - open_price) / open_price) * 100
-                
-                volume_data.append({
-                    'symbol': symbol,
-                    'volume': current_vol,
-                    'price_change': price_change,
-                    'last_price': last_price
-                })
-        
-        # Sort by volume descending
-        volume_data.sort(key=lambda x: x['volume'], reverse=True)
-        
-        # Get top 5 for scalping
-        top_5 = volume_data[:5]
-        
-        # Format message
-        msg = "🔥 *TOP SCALPING OPPORTUNITIES* 🔥\n\n"
-        msg += "Based on highest 15m volume & volatility\n\n"
-        
-        for i, coin in enumerate(top_5, 1):
-            symbol = coin['symbol']
-            vol_str = f"{coin['volume']/1000000:.2f}M"
-            change = coin['price_change']
-            price = coin['last_price']
-            
-            # Add emoji based on price movement
-            if change > 3:
-                trend = "🚀"
-            elif change > 1:
-                trend = "📈"
-            elif change < -3:
-                trend = "💥"
-            elif change < 0:
-                trend = "📉"
-            else:
-                trend = "➖"
-                
-            # Escape all Markdown special characters
-            symbol_esc = escape_markdown(symbol, version=2)
-            vol_str_esc = escape_markdown(vol_str, version=2)
-            change_esc = escape_markdown(f"{change:+.2f}%", version=2)
-            price_esc = escape_markdown(f"${price:,.2f}", version=2)
-            
-            msg += (
-                f"{i}\\. *{symbol_esc}*\n"
-                f"   💰 Price: `{price_esc}`\n"
-                f"   📊 Volume: `{vol_str_esc}`\n"
-                f"   📈 Change: `{change_esc}` {trend}\n\n"
-            )
-        
-        # Create properly escaped strategy tips
-        tips = (
-            "⚡ *Scalping Strategy Tips:*\n"
-            "\\- Trade with tight stop losses \\(0\\.5\\-1%\\)\n"
-            "\\- Target quick 0\\.5\\-2% gains\n"
-            "\\- Focus on 1\\-5m timeframes\n"
-            "\\- Use market orders for fast execution\n\n"
-            "_Trade responsibly\\. High volume coins can be volatile\\!_"
-        )
-        
-        msg += tips
-        
-        await update.message.reply_text(msg, parse_mode="MarkdownV2")
-        
-    except Exception as e:
-        logger.error(f"Error in hot-trade command: {e}")
-        error_msg = escape_markdown(f"❌ Error finding hot trades: {str(e)}", version=2)
-        await update.message.reply_text(error_msg, parse_mode="MarkdownV2")
+
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("advise", advise))
     app.add_handler(CommandHandler("suggest", suggest))
-    app.add_handler(CommandHandler("compare", compare))
-    app.add_handler(CommandHandler("volume", volume))
     app.add_handler(CommandHandler("news", news))
-    app.add_handler(CommandHandler("targets", targets))
+    app.add_handler(CommandHandler("target", targets))
     app.add_handler(CommandHandler("trade", trade))
-    app.add_handler(CommandHandler("scalping", scalping))
     commands = [
-        BotCommand("advise", "Get analysis for a specific coin"),
         BotCommand("suggest", "Suggest top coins to watch"),
-        BotCommand("compare", "Compare multi coins"),
-        BotCommand("volume", "Detect low volume or abnormal volume spikes"),
         BotCommand("news", "Fetch recent articles with the coin name or symbol keyword"),
-        BotCommand("targets", "Get buy/sell targets for a coin"),
+        BotCommand("target", "Get buy/sell targets for a coin"),
         BotCommand("trade", "Get trade setup for specific timeframe"),
-        BotCommand("scalping", "Find high-volume coins for scalping"),
     ]
+    async def post_init(app):
+        await set_commands(app)  # call the helper
+        coins_to_watch = ["BTCUSDT", "WCTUSDT", "SFPUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
+        asyncio.create_task(monitor_multiple_volume_ws(app, coins_to_watch))
+
     async def set_commands(app):
         await app.bot.set_my_commands(commands)
-    app.post_init = set_commands
+
+    app.post_init = post_init  # <- single entry point
     print("✅ Bot is running")
     app.run_polling()
 
